@@ -4,17 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
-	"github.com/xeipuuv/gojsonschema"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/utils/ptr"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kargoapi "github.com/akuity/kargo/api/v1alpha1"
 	libargocd "github.com/akuity/kargo/pkg/argocd"
@@ -53,21 +48,9 @@ func init() {
 // argocdUpdater is an implementation of the promotion.StepRunner interface that
 // updates one or more Argo CD Application resources.
 type argocdUpdater struct {
-	schemaLoader gojsonschema.JSONLoader
-
-	argocdClient client.Client
+	argocdBase
 
 	// These behaviors are overridable for testing purposes:
-
-	getAuthorizedApplicationsFn func(
-		context.Context,
-		*promotion.StepContext,
-		*builtin.ArgoCDAppUpdate,
-	) ([]*argocd.Application, error)
-
-	buildLabelSelectorFn func(
-		*builtin.ArgoCDAppSelector,
-	) (labels.Selector, error)
 
 	buildDesiredSourcesFn func(
 		update *builtin.ArgoCDAppUpdate,
@@ -113,10 +96,11 @@ type argocdUpdater struct {
 // newArgocdUpdater returns a implementation of the promotion.StepRunner
 // interfaces that updates Argo CD Application resources.
 func newArgocdUpdater(caps promotion.StepRunnerCapabilities) promotion.StepRunner {
-	r := &argocdUpdater{argocdClient: caps.ArgoCDClient}
-	r.schemaLoader = getConfigSchemaLoader(stepKindArgoCDUpdate)
+	r := &argocdUpdater{}
+	r.argocdClient = caps.ArgoCDClient
 	r.getAuthorizedApplicationsFn = r.getAuthorizedApplications
-	r.buildLabelSelectorFn = r.buildLabelSelector
+	r.buildLabelSelectorFn = buildArgoCDLabelSelector
+	r.schemaLoader = getConfigSchemaLoader(stepKindArgoCDUpdate)
 	r.buildDesiredSourcesFn = r.buildDesiredSources
 	r.mustPerformUpdateFn = r.mustPerformUpdate
 	r.syncApplicationFn = r.syncApplication
@@ -786,194 +770,6 @@ func (a *argocdUpdater) logAppEvent(
 			"reason", reason,
 		)
 	}
-}
-
-// getAuthorizedApplications returns a slice of Argo CD Applications that match
-// the given update specification (either by name or by label selector) and are
-// authorized for mutation by the Kargo Stage.
-func (a *argocdUpdater) getAuthorizedApplications(
-	ctx context.Context,
-	stepCtx *promotion.StepContext,
-	update *builtin.ArgoCDAppUpdate,
-) ([]*argocd.Application, error) {
-	namespace := update.Namespace
-	if namespace == "" {
-		namespace = libargocd.Namespace()
-	}
-
-	var apps []*argocd.Application
-
-	if update.Selector != nil {
-		// List Applications by label selector
-		labelSelector, err := a.buildLabelSelectorFn(update.Selector)
-		if err != nil {
-			return nil, fmt.Errorf("error building label selector: %w", err)
-		}
-
-		appList := &argocd.ApplicationList{}
-		listOpts := []client.ListOption{
-			client.InNamespace(namespace),
-			client.MatchingLabelsSelector{Selector: labelSelector},
-		}
-
-		if err = a.argocdClient.List(ctx, appList, listOpts...); err != nil {
-			return nil, fmt.Errorf("error listing Argo CD Applications matching selector: %w", err)
-		}
-
-		// Convert to pointer slice
-		for i := range appList.Items {
-			apps = append(apps, &appList.Items[i])
-		}
-	} else {
-		// Get single Application by name
-		app, err := argocd.GetApplication(ctx, a.argocdClient, namespace, update.Name)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"error finding Argo CD Application %q in namespace %q: %w",
-				update.Name, namespace, err,
-			)
-		}
-		if app == nil {
-			return nil, fmt.Errorf(
-				"unable to find Argo CD Application %q in namespace %q",
-				update.Name, namespace,
-			)
-		}
-		apps = append(apps, app)
-	}
-
-	// Filter by authorization
-	logger := logging.LoggerFromContext(ctx)
-	authorizedApps := make([]*argocd.Application, 0, len(apps))
-	for _, app := range apps {
-		if err := a.authorizeArgoCDAppUpdate(stepCtx, app.ObjectMeta); err != nil {
-			// Log warning but continue with other apps
-			logger.Info(
-				"skipping unauthorized Application",
-				"app", app.Name,
-				"namespace", app.Namespace,
-				"reason", err.Error(),
-			)
-			continue
-		}
-		authorizedApps = append(authorizedApps, app)
-	}
-
-	if len(authorizedApps) == 0 {
-		if update.Selector != nil {
-			totalAppsFound := len(apps)
-			if totalAppsFound == 0 {
-				return nil, fmt.Errorf(
-					"no Argo CD Applications found matching selector in namespace %q",
-					namespace,
-				)
-			}
-			return nil, fmt.Errorf(
-				"found %d Application(s) matching selector in namespace %q, but none are authorized for Stage %s:%s",
-				totalAppsFound, namespace, stepCtx.Project, stepCtx.Stage,
-			)
-		}
-		// nolint:staticcheck
-		return nil, fmt.Errorf(
-			"Argo CD Application %q in namespace %q is not authorized",
-			update.Name, namespace,
-		)
-	}
-
-	return authorizedApps, nil
-}
-
-// authorizeArgoCDAppUpdate returns an error if the Argo CD Application
-// represented by appMeta does not explicitly permit mutation by the Kargo Stage
-// represented by stageMeta.
-func (a *argocdUpdater) authorizeArgoCDAppUpdate(
-	stepCtx *promotion.StepContext,
-	appMeta metav1.ObjectMeta,
-) error {
-	// nolint:staticcheck
-	permErr := fmt.Errorf(
-		"Argo CD Application %q in namespace %q does not permit mutation by "+
-			"Kargo Stage %s in namespace %s",
-		appMeta.Name,
-		appMeta.Namespace,
-		stepCtx.Stage,
-		stepCtx.Project,
-	)
-
-	allowedStage, ok := appMeta.Annotations[kargoapi.AnnotationKeyAuthorizedStage]
-	if !ok {
-		return permErr
-	}
-
-	tokens := strings.SplitN(allowedStage, ":", 2)
-	if len(tokens) != 2 {
-		return fmt.Errorf(
-			"unable to parse value of annotation %q (%q) on Argo CD Application %q in namespace %q",
-			kargoapi.AnnotationKeyAuthorizedStage,
-			allowedStage,
-			appMeta.Name,
-			appMeta.Namespace,
-		)
-	}
-
-	projectName, stageName := tokens[0], tokens[1]
-	if strings.Contains(projectName, "*") || strings.Contains(stageName, "*") {
-		// nolint:staticcheck
-		return fmt.Errorf(
-			"Argo CD Application %q in namespace %q has deprecated glob expression in annotation %q (%q)",
-			appMeta.Name,
-			appMeta.Namespace,
-			kargoapi.AnnotationKeyAuthorizedStage,
-			allowedStage,
-		)
-	}
-	if projectName != stepCtx.Project || stageName != stepCtx.Stage {
-		return permErr
-	}
-	return nil
-}
-
-// buildLabelSelector converts an ArgoCDAppSelector into a Kubernetes labels.Selector.
-func (a *argocdUpdater) buildLabelSelector(
-	selector *builtin.ArgoCDAppSelector,
-) (labels.Selector, error) {
-	if len(selector.MatchLabels) == 0 && len(selector.MatchExpressions) == 0 {
-		return nil, fmt.Errorf("selector must have at least one match criterion")
-	}
-
-	labelSelector := labels.NewSelector()
-
-	for key, value := range selector.MatchLabels {
-		req, err := labels.NewRequirement(key, selection.Equals, []string{value})
-		if err != nil {
-			return nil, fmt.Errorf("invalid matchLabel %s=%s: %w", key, value, err)
-		}
-		labelSelector = labelSelector.Add(*req)
-	}
-
-	for _, expr := range selector.MatchExpressions {
-		var op selection.Operator
-		switch expr.Operator {
-		case builtin.In:
-			op = selection.In
-		case builtin.NotIn:
-			op = selection.NotIn
-		case builtin.Exists:
-			op = selection.Exists
-		case builtin.DoesNotExist:
-			op = selection.DoesNotExist
-		default:
-			return nil, fmt.Errorf("invalid operator: %s", expr.Operator)
-		}
-
-		req, err := labels.NewRequirement(expr.Key, op, expr.Values)
-		if err != nil {
-			return nil, fmt.Errorf("invalid matchExpression: %w", err)
-		}
-		labelSelector = labelSelector.Add(*req)
-	}
-
-	return labelSelector, nil
 }
 
 // applyArgoCDSourceUpdate updates a single Argo CD ApplicationSource.
